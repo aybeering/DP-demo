@@ -8,6 +8,7 @@ from src.data.conformer_gen import build_conformer_dataset
 from src.data.dataset import PathDataset, build_path_samples
 from src.models.energy_head import EnergyHead
 from src.models.gnn_encoder import GNNEncoder
+from src.models.momentum_head import MomentumHead
 from src.models.step_predictor import StepPredictor
 from src.train.losses import total_loss
 from src.utils.config import TrainConfig
@@ -17,14 +18,17 @@ from src.utils.logging import setup_logger
 def train_one_epoch(
     encoder,
     stepper,
+    momentum_head,
     energy_head,
     loader: DataLoader,
     optimizer,
     device: torch.device,
+    field_scale: float = 1.0,
 ) -> float:
     """单个 epoch 训练，返回平均 loss。"""
     encoder.train()
     stepper.train()
+    momentum_head.train()
     energy_head.train()
 
     total = 0.0
@@ -36,7 +40,7 @@ def train_one_epoch(
 
         z_t = encoder(data_t)
         z_next_true = encoder(data_next).detach()
-        delta_z = stepper(z_t, env)
+        delta_z = stepper(z_t, env) + field_scale * momentum_head(env)
         z_next_pred = z_t + delta_z
         energy_pred = energy_head(z_next_pred)
 
@@ -73,21 +77,34 @@ def train(
 
     encoder = GNNEncoder(in_dim=in_dim, out_dim=config.emb_dim).to(device)
     stepper = StepPredictor(z_dim=config.emb_dim, env_dim=env_dim).to(device)
+    momentum_head = MomentumHead(env_dim=env_dim, out_dim=config.emb_dim).to(device)
     energy_head = EnergyHead(in_dim=config.emb_dim).to(device)
 
     optimizer = torch.optim.Adam(
-        list(encoder.parameters()) + list(stepper.parameters()) + list(energy_head.parameters()),
+        list(encoder.parameters())
+        + list(stepper.parameters())
+        + list(momentum_head.parameters())
+        + list(energy_head.parameters()),
         lr=config.lr,
     )
 
     for epoch in range(config.epochs):
-        avg_loss = train_one_epoch(encoder, stepper, energy_head, loader, optimizer, device)
+        avg_loss = train_one_epoch(
+            encoder,
+            stepper,
+            momentum_head,
+            energy_head,
+            loader,
+            optimizer,
+            device,
+        )
         logger.info("Epoch %s | loss=%.4f", epoch + 1, avg_loss)
 
     torch.save(
         {
             "encoder": encoder.state_dict(),
             "stepper": stepper.state_dict(),
+            "momentum_head": momentum_head.state_dict(),
             "energy_head": energy_head.state_dict(),
         },
         "outputs/model.pt",
